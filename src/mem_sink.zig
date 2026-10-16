@@ -5,16 +5,25 @@ const std = @import("std");
 const main = @import("main.zig");
 const model = @import("model.zig");
 const sink = @import("sink.zig");
-
+const Mutex = @import("mutex.zig").AdaptiveMutex;
+const _hash = @import("hash.zig");
+const ThreadSafeArena = @import("threadsafe_arena.zig");
+const SwissTable = @import("swiss_table.zig").SwissTable;
 
 pub const global = struct {
     pub var root: ?*model.Dir = null;
     pub var stats: bool = true; // calculate aggregate directory stats
+    // Shared backing arena. Each worker's local ArenaAllocator batches small
+    // allocations into larger chunks allocated from this thread-safe arena.
+    pub var arena: ThreadSafeArena = .init(std.heap.c_allocator);
 };
 
 pub const Thread = struct {
-    // Arena allocator for model.Entry structs, these are never freed.
-    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    // Entries allocated during a scan outlive the sink worker, so the chunks
+    // are intentionally retained by the shared backing arena after this state
+    // is discarded. Local bump allocations avoid a shared atomic operation for
+    // every entry.
+    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(global.arena.allocator()),
 };
 
 pub fn statToEntry(stat: *const sink.Stat, e: *model.Entry, parent: *model.Dir) void {
@@ -49,54 +58,49 @@ pub const Dir = struct {
     items: u32 = 0,
     mtime: u64 = 0,
     suberr: bool = false,
-    lock: std.Thread.Mutex = .{},
+    lock: Mutex = .{},
 
-    const Map = std.HashMap(*model.Entry, void, HashContext, 80);
+    const Map = SwissTable([]const u8, *model.Entry, 16, eqlName, hashName, entryName, 0.87, null);
 
-    const HashContext = struct {
-        pub fn hash(_: @This(), e: *model.Entry) u64 {
-            return std.hash.Wyhash.hash(0, e.name());
-        }
-        pub fn eql(_: @This(), a: *model.Entry, b: *model.Entry) bool {
-            return a == b or std.mem.eql(u8, a.name(), b.name());
-        }
-    };
+    inline fn hashName(name: []const u8) u64 {
+        return _hash.hash_inline(name, 0);
+    }
 
-    const HashContextAdapted = struct {
-        pub fn hash(_: @This(), v: []const u8) u64 {
-            return std.hash.Wyhash.hash(0, v);
-        }
-        pub fn eql(_: @This(), a: []const u8, b: *model.Entry) bool {
-            return std.mem.eql(u8, a, b.name());
-        }
-    };
+    inline fn eqlName(a: []const u8, b: []const u8) bool {
+        return std.mem.eql(u8, a, b);
+    }
+
+    inline fn entryName(e: *const *model.Entry) []const u8 {
+        return e.*.name();
+    }
 
     fn init(dir: *model.Dir) Dir {
+        var count: usize = 0;
+        var it = dir.sub.ptr;
+        while (it) |e| : (it = e.next.ptr) count += 1;
+
         var self = Dir{
             .dir = dir,
-            .entries = Map.initContext(main.allocator, HashContext{}),
+            .entries = Map.init(main.allocator, count) catch unreachable,
             .own_blocks = dir.entry.pack.blocks,
             .own_bytes = dir.entry.size,
         };
-
-        var count: Map.Size = 0;
-        var it = dir.sub.ptr;
-        while (it) |e| : (it = e.next.ptr) count += 1;
+        self.entries.ensureTotalCapacity(count) catch unreachable;
         self.entries.ensureUnusedCapacity(count) catch unreachable;
 
         it = dir.sub.ptr;
         while (it) |e| : (it = e.next.ptr)
-            self.entries.putAssumeCapacity(e, {});
+            self.entries.putAssumeCapacity(e.name(), e);
         return self;
     }
 
     fn getEntry(self: *Dir, t: *Thread, etype: model.EType, isext: bool, name: []const u8) *model.Entry {
-        if (self.entries.getKeyAdapted(name, HashContextAdapted{})) |e| {
-            // XXX: In-place conversion may be possible in some cases.
+        if (self.entries.get(name)) |e| {
+            // Reuse the allocation only when the new entry has a compatible layout.
             if (e.pack.etype.base() == etype.base() and (!isext or e.pack.isext)) {
                 e.pack.etype = etype;
                 e.pack.isext = isext;
-                _ = self.entries.removeAdapted(name, HashContextAdapted{});
+                _ = self.entries.remove(name);
                 return e;
             }
         }
@@ -142,8 +146,7 @@ pub const Dir = struct {
         if (self.entries.count() > 0) {
             var it = &self.dir.sub.ptr;
             while (it.*) |e| {
-                if (self.entries.getKey(e) == e) it.* = e.next.ptr
-                else it = &e.next.ptr;
+                if (self.entries.get(e.name()) == e) it.* = e.next.ptr else it = &e.next.ptr;
             }
         }
         self.entries.deinit();

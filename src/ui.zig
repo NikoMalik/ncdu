@@ -7,6 +7,7 @@ const std = @import("std");
 const main = @import("main.zig");
 const util = @import("util.zig");
 const c = @import("c.zig").c;
+const strconv = @import("strconv.zig");
 
 pub var inited: bool = false;
 pub var main_thread: std.Thread.Id = undefined;
@@ -389,15 +390,24 @@ pub fn addstr(s: [:0]const u8) void {
     _ = c.addstr(s.ptr);
 }
 
-// Not to be used for strings that may end up >256 bytes.
-pub fn addprint(comptime fmt: []const u8, args: anytype) void {
-    var buf: [256:0]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, fmt, args) catch unreachable;
-    addstr(s);
-}
-
 pub fn addch(ch: c.chtype) void {
     _ = c.addch(ch);
+}
+
+pub fn adduint(v: anytype) usize {
+    var buf: [32:0]u8 = undefined;
+    const len = strconv.format_uint(@TypeOf(v), buf[0..], v);
+    buf[len] = 0;
+    addstr(buf[0..len :0]);
+    return len;
+}
+
+pub fn adduintRight(v: anytype, width: usize) void {
+    var buf: [32:0]u8 = undefined;
+    const len = strconv.format_uint(@TypeOf(v), buf[0..], v);
+    if (len < width) for (len..width) |_| addch(' ');
+    buf[len] = 0;
+    addstr(buf[0..len :0]);
 }
 
 // Format an integer to a human-readable size string.
@@ -499,7 +509,8 @@ pub fn addsize(bg: Bg, v: u64) void {
 // (Assuming thousands_sep takes a single column)
 pub fn addnum(bg: Bg, v: u64) void {
     var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable;
+    const len = strconv.format_uint(u64, &buf, v);
+    const s = buf[0..len];
     var f: [64:0]u8 = undefined;
     var i: usize = 0;
     for (s, 0..) |digit, n| {

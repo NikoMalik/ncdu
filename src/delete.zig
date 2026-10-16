@@ -19,6 +19,8 @@ var state: enum { confirm, busy, err } = .confirm;
 var confirm: enum { yes, no, ignore } = .no;
 var error_option: enum { abort, ignore, all } = .abort;
 var error_code: anyerror = undefined;
+var deleted_items: u64 = 0;
+var total_items: u64 = 0;
 
 pub fn setup(p: *model.Dir, e: *model.Entry, n: ?*model.Entry) void {
     parent = p;
@@ -26,6 +28,8 @@ pub fn setup(p: *model.Dir, e: *model.Entry, n: ?*model.Entry) void {
     next_sel = n;
     state = if (main.config.confirm_delete) .confirm else .busy;
     confirm = .no;
+    deleted_items = 0;
+    total_items = 1 + (if (e.dir()) |d| d.items else 0);
 }
 
 
@@ -68,6 +72,7 @@ fn deleteItem(dir: std.fs.Dir, path: [:0]const u8, ptr: *align(1) ?*model.Entry)
         dir.deleteFileZ(path) catch |e| return err(e);
     ptr.*.?.zeroStats(parent);
     ptr.* = ptr.*.?.next.ptr;
+    deleted_items += 1;
     return false;
 }
 
@@ -122,6 +127,11 @@ fn deleteCmd(path: [:0]const u8, ptr: *align(1) ?*model.Entry) bool {
     return false;
 }
 
+fn updateParentSubErr() void {
+    var dir: ?*model.Dir = parent;
+    while (dir) |d| : (dir = d.parent) d.updateSubErr();
+}
+
 // Returns the item that should be selected in the browser.
 pub fn delete() ?*model.Entry {
     while (main.state == .delete and state == .confirm)
@@ -146,10 +156,12 @@ pub fn delete() ?*model.Entry {
     if (main.config.delete_command.len == 0) {
         _ = deleteItem(std.fs.cwd(), util.arrayListBufZ(&path, main.allocator), it);
         model.inodes.addAllStats();
+        updateParentSubErr();
         return if (it.* == e) e else next_sel;
     } else {
         const isdel = deleteCmd(util.arrayListBufZ(&path, main.allocator), it);
         model.inodes.addAllStats();
+        updateParentSubErr();
         return if (isdel) next_sel else it.*;
     }
 }
@@ -203,11 +215,20 @@ fn drawProgress() void {
     path.append(main.allocator, '/') catch unreachable;
     path.appendSlice(main.allocator, entry.name()) catch unreachable;
 
-    // TODO: Item counts and progress bar would be nice.
-
     const box = ui.Box.create(6, 60, "Deleting...");
     box.move(2, 2);
     ui.addstr(ui.shorten(ui.toUtf8(util.arrayListBufZ(&path, main.allocator)), 56));
+    const bar_width: u64 = 32;
+    const filled = if (total_items == 0) bar_width else deleted_items * bar_width / total_items;
+    box.move(3, 2);
+    ui.addch('[');
+    for (0..bar_width) |i| ui.addch(if (i < filled) '#' else ' ');
+    ui.addch(']');
+    box.move(4, 2);
+    _ = ui.adduint(deleted_items);
+    ui.addstr(" / ");
+    _ = ui.adduint(total_items);
+    ui.addstr(" items");
     box.move(4, 41);
     ui.addstr("Press ");
     ui.style(.key);

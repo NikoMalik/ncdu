@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
+const Mutex = @import("mutex.zig").AdaptiveMutex;
 const main = @import("main.zig");
 const ui = @import("ui.zig");
+const fastmem = @import("fastmem.zig");
+const hash = @import("hash.zig");
+const SwissTable = @import("swiss_table.zig").SwissTable;
 const util = @import("util.zig");
 
 // Numbers are used in the binfmt export, so must be stable.
@@ -46,8 +50,7 @@ pub const Ref = extern union {
     ref: u64 align(1),
 
     pub fn isNull(r: Ref) bool {
-        if (main.config.binreader) return r.ref == std.math.maxInt(u64)
-        else return r.ptr == null;
+        if (main.config.binreader) return r.ref == std.math.maxInt(u64) else return r.ptr == null;
     }
 };
 
@@ -98,7 +101,7 @@ pub const Entry = extern struct {
     }
 
     pub fn nameHash(self: *const Self) u64 {
-        return std.hash.Wyhash.hash(0, self.name());
+        return hash.hash_inline(@as([]const u8, self.name()), 0);
     }
 
     pub fn ext(self: *Self) ?*Ext {
@@ -110,8 +113,7 @@ pub const Entry = extern struct {
         const size = (if (isext) @as(usize, @sizeOf(Ext)) else 0) + @sizeOf(T) + ename.len + 1;
         var ptr = blk: while (true) {
             const alignment = if (@typeInfo(@TypeOf(std.mem.Allocator.allocWithOptions)).@"fn".params[3].type == ?u29) 1 else std.mem.Alignment.@"1";
-            if (allocator.allocWithOptions(u8, size, alignment, null)) |p| break :blk p
-            else |_| {}
+            if (allocator.allocWithOptions(u8, size, alignment, null)) |p| break :blk p else |_| {}
             ui.oom();
         };
         if (isext) {
@@ -120,15 +122,15 @@ pub const Entry = extern struct {
         }
         const e: *T = @ptrCast(ptr);
         e.* = .{ .entry = .{ .pack = .{ .etype = etype, .isext = isext } } };
-        const n = @as([*]u8, @ptrCast(&e.name))[0..ename.len+1];
-        @memcpy(n[0..ename.len], ename);
+        const n = @as([*]u8, @ptrCast(&e.name))[0 .. ename.len + 1];
+        fastmem.copy(u8, n[0..ename.len], ename);
         n[ename.len] = 0;
         return &e.entry;
     }
 
     pub fn create(allocator: std.mem.Allocator, etype: EType, isext: bool, ename: []const u8) *Entry {
         return switch (etype) {
-            .dir  => alloc(Dir, allocator, etype, isext, ename),
+            .dir => alloc(Dir, allocator, etype, isext, ename),
             .link => alloc(Link, allocator, etype, isext, ename),
             else => alloc(File, allocator, etype, isext, ename),
         };
@@ -146,9 +148,7 @@ pub const Entry = extern struct {
     }
 
     fn hasErr(self: *Self) bool {
-        return
-            if(self.dir()) |d| d.pack.err or d.pack.suberr
-            else self.pack.etype == .err;
+        return if (self.dir()) |d| d.pack.err or d.pack.suberr else self.pack.etype == .err;
     }
 
     fn removeLinks(self: *Entry) void {
@@ -227,9 +227,9 @@ pub const Dir = extern struct {
             if (withRoot or e.parent != null)
                 components.append(main.allocator, e.entry.name()) catch unreachable;
 
-        var i: usize = components.items.len-1;
+        var i: usize = components.items.len - 1;
         while (true) {
-            if (i != components.items.len-1 and !(out.items.len != 0 and out.items[out.items.len-1] == '/'))
+            if (i != components.items.len - 1 and !(out.items.len != 0 and out.items[out.items.len - 1] == '/'))
                 out.append(main.allocator, '/') catch unreachable;
             out.appendSlice(alloc, components.items[i]) catch unreachable;
             if (i == 0) break;
@@ -284,12 +284,14 @@ pub const Link = extern struct {
     pub fn addLink(l: *@This()) void {
         const d = inodes.map.getOrPut(l) catch unreachable;
         if (!d.found_existing) {
+            d.ptr.* = l;
             l.next = l;
             l.prev = l;
         } else {
-            inodes.setStats(d.key_ptr.*, false);
-            l.next = d.key_ptr.*;
-            l.prev = d.key_ptr.*.prev;
+            const head = d.ptr.*;
+            inodes.setStats(head, false);
+            l.next = head;
+            l.prev = head.prev;
             l.next.prev = l;
             l.prev.next = l;
         }
@@ -311,8 +313,8 @@ pub const Link = extern struct {
             // the nlink count likely won't change. Best we can hope for is
             // that a refresh will encounter another link to the same inode and
             // trigger an nlink change.
-            if (entry.key_ptr.* == l)
-                entry.key_ptr.* = l.next;
+            if (entry.value == l)
+                inodes.map.put(l, l.next) catch unreachable;
             inodes.addUncounted(l.next);
             l.next.prev = l.prev;
             l.prev.next = l.next;
@@ -346,11 +348,10 @@ pub const Ext = extern struct {
     }
 };
 
-
 // List of st_dev entries. Those are typically 64bits, but that's quite a waste
 // of space when a typical scan won't cover many unique devices.
 pub const devices = struct {
-    var lock = std.Thread.Mutex{};
+    var lock = Mutex{};
     // id -> dev
     pub var list: std.ArrayListUnmanaged(u64) = .empty;
     // dev -> id
@@ -369,45 +370,64 @@ pub const devices = struct {
     }
 };
 
-
 // Lookup table for ino -> *Link entries, used for hard link counting.
 pub const inodes = struct {
     // Keys are hashed by their (dev,ino), the *Link points to an arbitrary
     // node in the list. Link entries with the same dev/ino are part of a
     // circular linked list, so you can iterate through all of them with this
     // single pointer.
-    const Map = std.HashMap(*Link, void, HashContext, 80);
-    pub var map = Map.init(main.allocator);
+    const Map = SwissTable(*Link, *Link, 16, eql, hashKey, valueKey, 0.87, null);
+    pub var map = Map.init(main.allocator, 0) catch unreachable;
 
     // List of nodes in 'map' with !counted, to speed up addAllStats().
     // If this list grows large relative to the number of nodes in 'map', then
     // this list is cleared and uncounted_full is set instead, so that
     // addAllStats() will do a full iteration over 'map'.
-    var uncounted = std.HashMap(*Link, void, HashContext, 80).init(main.allocator);
+    var uncounted = Map.init(main.allocator, 0) catch unreachable;
     var uncounted_full = true; // start with true for the initial scan
 
-    pub var lock = std.Thread.Mutex{};
+    const DirCount = struct { dir: *Dir, count: u32 };
+    const DirCountMap = SwissTable(*Dir, DirCount, 16, eqlDir, hashDir, dirCountKey, 0.87, null);
 
-    const HashContext = struct {
-        pub fn hash(_: @This(), l: *Link) u64 {
-            var h = std.hash.Wyhash.init(0);
-            h.update(std.mem.asBytes(&@as(u32, l.parent.pack.dev)));
-            h.update(std.mem.asBytes(&l.ino));
-            return h.final();
-        }
+    // Reused by setStats(). During scanning, calls are serialized by `lock`;
+    // addAllStats() runs after all scan workers have joined.
+    var stats_dirs = DirCountMap.init(main.allocator, 0) catch unreachable;
 
-        pub fn eql(_: @This(), a: *Link, b: *Link) bool {
-            return a.ino == b.ino and a.parent.pack.dev == b.parent.pack.dev;
-        }
-    };
+    pub var lock = Mutex{};
+
+    inline fn hashKey(l: *Link) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&@as(u32, l.parent.pack.dev)));
+        h.update(std.mem.asBytes(&l.ino));
+        return h.final();
+    }
+
+    inline fn eql(a: *Link, b: *Link) bool {
+        return a.ino == b.ino and a.parent.pack.dev == b.parent.pack.dev;
+    }
+
+    inline fn valueKey(value: *const *Link) *Link {
+        return value.*;
+    }
+
+    inline fn hashDir(dir: *Dir) u64 {
+        return hash.hash_inline(@intFromPtr(dir), 0);
+    }
+
+    inline fn eqlDir(a: *Dir, b: *Dir) bool {
+        return a == b;
+    }
+
+    inline fn dirCountKey(value: *const DirCount) *Dir {
+        return value.dir;
+    }
 
     fn addUncounted(l: *Link) void {
         if (uncounted_full) return;
-        if (uncounted.count() > map.count()/8) {
+        if (uncounted.count() > map.count() / 8) {
             uncounted.clearAndFree();
             uncounted_full = true;
-        } else
-            (uncounted.getOrPut(l) catch unreachable).key_ptr.* = l;
+        } else (uncounted.getOrPut(l) catch unreachable).ptr.* = l;
     }
 
     // Add/remove this inode from the parent Dir sizes. When removing stats,
@@ -417,10 +437,35 @@ pub const inodes = struct {
     fn setStats(l: *Link, add: bool) void {
         if (l.pack.counted == add) return;
 
+        // Most inodes with nlink > 1 have only one link inside the scanned
+        // tree. Their ancestor counts are all exactly one, so avoid building
+        // and probing the temporary directory map for every such inode.
+        if (l.next == l) {
+            l.pack.counted = add;
+            const shared = l.pack.nlink > 1;
+            var parent: ?*Dir = l.parent;
+            while (parent) |dir| : (parent = dir.parent) {
+                if (add) {
+                    dir.entry.pack.blocks +|= l.entry.pack.blocks;
+                    dir.entry.size +|= l.entry.size;
+                    if (shared) {
+                        dir.shared_blocks +|= l.entry.pack.blocks;
+                        dir.shared_size +|= l.entry.size;
+                    }
+                } else {
+                    dir.entry.pack.blocks -|= l.entry.pack.blocks;
+                    dir.entry.size -|= l.entry.size;
+                    if (shared) {
+                        dir.shared_blocks -|= l.entry.pack.blocks;
+                        dir.shared_size -|= l.entry.size;
+                    }
+                }
+            }
+            return;
+        }
+
         var nlink: u31 = 0;
         var inconsistent = false;
-        var dirs = std.AutoHashMap(*Dir, u32).init(main.allocator);
-        defer dirs.deinit();
         var it = l;
         while (true) {
             it.pack.counted = add;
@@ -428,9 +473,12 @@ pub const inodes = struct {
             if (it.pack.nlink != l.pack.nlink) inconsistent = true;
             var parent: ?*Dir = it.parent;
             while (parent) |p| : (parent = p.parent) {
-                const de = dirs.getOrPut(p) catch unreachable;
-                if (de.found_existing) de.value_ptr.* += 1
-                else de.value_ptr.* = 1;
+                const de = stats_dirs.getOrPut(p) catch unreachable;
+                if (de.found_existing) {
+                    de.ptr.count += 1;
+                } else {
+                    de.ptr.* = .{ .dir = p, .count = 1 };
+                }
             }
             it = it.next;
             if (it == l)
@@ -448,25 +496,27 @@ pub const inodes = struct {
         // using the given 'l' size for all Links. Might warrant a warning as
         // well.
 
-        var dir_iter = dirs.iterator();
-        if (add) {
-            while (dir_iter.next()) |de| {
-                de.key_ptr.*.entry.pack.blocks +|= l.entry.pack.blocks;
-                de.key_ptr.*.entry.size        +|= l.entry.size;
-                if (de.value_ptr.* < nlink) {
-                    de.key_ptr.*.shared_blocks +|= l.entry.pack.blocks;
-                    de.key_ptr.*.shared_size   +|= l.entry.size;
+        var dir_iter = stats_dirs.iterator();
+        while (dir_iter.next()) |de| {
+            const dir = de[1].dir;
+            if (add) {
+                dir.entry.pack.blocks +|= l.entry.pack.blocks;
+                dir.entry.size +|= l.entry.size;
+                if (de[1].count < nlink) {
+                    dir.shared_blocks +|= l.entry.pack.blocks;
+                    dir.shared_size +|= l.entry.size;
+                }
+            } else {
+                dir.entry.pack.blocks -|= l.entry.pack.blocks;
+                dir.entry.size -|= l.entry.size;
+                if (de[1].count < nlink) {
+                    dir.shared_blocks -|= l.entry.pack.blocks;
+                    dir.shared_size -|= l.entry.size;
                 }
             }
-        } else {
-            while (dir_iter.next()) |de| {
-                de.key_ptr.*.entry.pack.blocks -|= l.entry.pack.blocks;
-                de.key_ptr.*.entry.size        -|= l.entry.size;
-                if (de.value_ptr.* < nlink) {
-                    de.key_ptr.*.shared_blocks -|= l.entry.pack.blocks;
-                    de.key_ptr.*.shared_size   -|= l.entry.size;
-                }
-            }
+            // Empty only the occupied slots; clearing the entire SwissTable
+            // here would touch its maximum capacity for every inode.
+            _ = stats_dirs.remove(de[0]);
         }
     }
 
@@ -478,31 +528,29 @@ pub const inodes = struct {
         if (uncounted_full) {
             add_total = map.count();
             add_done = 0;
-            var it = map.keyIterator();
-            while (it.next()) |e| {
-                setStats(e.*, true);
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                setStats(entry[1], true);
                 add_done += 1;
-                if ((add_done & 65) == 0) main.handleEvent(false, false);
+                if ((add_done & 63) == 0) main.handleEvent(false, false);
             }
         } else {
             add_total = uncounted.count();
             add_done = 0;
-            var it = uncounted.keyIterator();
-            while (it.next()) |u| {
-                if (map.getKey(u.*)) |e| setStats(e, true);
+            var it = uncounted.iterator();
+            while (it.next()) |entry| {
+                if (map.get(entry[0])) |e| setStats(e, true);
                 add_done += 1;
-                if ((add_done & 65) == 0) main.handleEvent(false, false);
+                if ((add_done & 63) == 0) main.handleEvent(false, false);
             }
         }
         uncounted_full = false;
         if (uncounted.count() > 0)
-            uncounted.clearAndFree();
+            uncounted.clear();
     }
 };
 
-
 pub var root: *Dir = undefined;
-
 
 test "entry" {
     var e = Entry.create(std.testing.allocator, .reg, false, "hello");

@@ -9,7 +9,7 @@ const sink = @import("sink.zig");
 const ui = @import("ui.zig");
 const exclude = @import("exclude.zig");
 const c = @import("c.zig").c;
-
+const fastmem = @import("fastmem.zig");
 
 // This function only works on Linux
 fn isKernfs(dir: std.fs.Dir) bool {
@@ -28,23 +28,20 @@ fn isKernfs(dir: std.fs.Dir) bool {
         0x73636673, // SECURITYFS_MAGIC
         0xf97cff8c, // SELINUX_MAGIC
         0x62656572, // SYSFS_MAGIC
-        0x74726163 // TRACEFS_MAGIC
+        0x74726163, // TRACEFS_MAGIC
         => true,
         else => false,
     };
     return iskern;
 }
 
-
 fn clamp(comptime T: type, comptime field: anytype, x: anytype) std.meta.fieldInfo(T, field).type {
     return util.castClamp(std.meta.fieldInfo(T, field).type, x);
 }
 
-
 fn truncate(comptime T: type, comptime field: anytype, x: anytype) std.meta.fieldInfo(T, field).type {
     return util.castTruncate(std.meta.fieldInfo(T, field).type, x);
 }
-
 
 pub fn statAt(parent: std.fs.Dir, name: [:0]const u8, follow: bool, symlink: ?*bool) !sink.Stat {
     // std.posix.fstatatZ() in Zig 0.14 is not suitable due to https://github.com/ziglang/zig/issues/23463
@@ -60,11 +57,7 @@ pub fn statAt(parent: std.fs.Dir, name: [:0]const u8, follow: bool, symlink: ?*b
     }
     if (symlink) |s| s.* = std.c.S.ISLNK(stat.mode);
     return sink.Stat{
-        .etype =
-            if (std.c.S.ISDIR(stat.mode)) .dir
-            else if (stat.nlink > 1) .link
-            else if (!std.c.S.ISREG(stat.mode)) .nonreg
-            else .reg,
+        .etype = if (std.c.S.ISDIR(stat.mode)) .dir else if (stat.nlink > 1) .link else if (!std.c.S.ISREG(stat.mode)) .nonreg else .reg,
         .blocks = clamp(sink.Stat, .blocks, stat.blocks),
         .size = clamp(sink.Stat, .size, stat.size),
         .dev = truncate(sink.Stat, .dev, stat.dev),
@@ -85,7 +78,6 @@ pub fn statAt(parent: std.fs.Dir, name: [:0]const u8, follow: bool, symlink: ?*b
     };
 }
 
-
 fn isCacheDir(dir: std.fs.Dir) bool {
     const sig = "Signature: 8a477f597d28d172789f06886806bc55";
     const f = dir.openFileZ("CACHEDIR.TAG", .{}) catch return false;
@@ -94,7 +86,6 @@ fn isCacheDir(dir: std.fs.Dir) bool {
     const len = f.readAll(&buf) catch return false;
     return len == sig.len and std.mem.eql(u8, &buf, sig);
 }
-
 
 const State = struct {
     // Simple LIFO queue. Threads attempt to fully scan their assigned
@@ -111,6 +102,7 @@ const State = struct {
     queue_cond: std.Thread.Condition = .{},
 
     threads: []Thread,
+    finished: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     waiting: usize = 0,
 
     // No clue what this should be set to. Dir structs aren't small so we don't
@@ -152,7 +144,6 @@ const State = struct {
     }
 };
 
-
 const Dir = struct {
     fd: std.fs.Dir,
     dev: u64,
@@ -181,7 +172,6 @@ const Dir = struct {
 };
 
 const Thread = struct {
-    thread_num: usize,
     sink: *sink.Thread,
     state: *State,
     stack: std.ArrayListUnmanaged(*Dir) = .empty,
@@ -194,9 +184,9 @@ const Thread = struct {
             return;
         }
 
-        @memcpy(t.namebuf[0..name_.len], name_);
+        fastmem.copy(u8, t.namebuf[0..name_.len], name_);
         t.namebuf[name_.len] = 0;
-        const name = t.namebuf[0..name_.len:0];
+        const name = t.namebuf[0..name_.len :0];
 
         const excluded = dir.pat.match(name);
         if (excluded == false) { // matched either a file or directory, so we can exclude this before stat()ing.
@@ -246,11 +236,7 @@ const Thread = struct {
             return;
         };
 
-        if (@import("builtin").os.tag == .linux
-            and main.config.exclude_kernfs
-            and stat.dev != dir.dev
-            and isKernfs(edir)
-        ) {
+        if (@import("builtin").os.tag == .linux and main.config.exclude_kernfs and stat.dev != dir.dev and isKernfs(edir)) {
             edir.close();
             dir.sink.addSpecial(t.sink, name, .kernfs);
             return;
@@ -270,6 +256,7 @@ const Thread = struct {
 
     fn run(t: *Thread) void {
         defer t.stack.deinit(main.allocator);
+        defer _ = t.state.finished.fetchAdd(1, .release);
         while (t.state.waitPop()) |dir| {
             t.stack.append(main.allocator, dir) catch unreachable;
 
@@ -277,14 +264,12 @@ const Thread = struct {
                 const d = t.stack.items[t.stack.items.len - 1];
 
                 t.sink.setDir(d.sink);
-                if (t.thread_num == 0) main.handleEvent(false, false);
 
                 const entry = d.it.next() catch blk: {
                     dir.sink.setReadError(t.sink);
                     break :blk null;
                 };
-                if (entry) |e| t.scanOne(d, e.name)
-                else {
+                if (entry) |e| t.scanOne(d, e.name) else {
                     t.sink.setDir(null);
                     t.stack.pop().?.destroy(t);
                 }
@@ -292,7 +277,6 @@ const Thread = struct {
         }
     }
 };
-
 
 pub fn scan(path: [:0]const u8) !void {
     const sink_threads = sink.createThreads(main.config.threads);
@@ -302,24 +286,58 @@ pub fn scan(path: [:0]const u8) !void {
     const stat = try statAt(std.fs.cwd(), path, true, &symlink);
     const fd = try std.fs.cwd().openDirZ(path, .{ .iterate = true });
 
-    var state = State{
-        .threads = main.allocator.alloc(Thread, main.config.threads) catch unreachable,
-    };
-    defer main.allocator.free(state.threads);
+    const thread_storage = main.allocator.alloc(Thread, main.config.threads) catch unreachable;
+    var state = State{ .threads = thread_storage };
+    defer main.allocator.free(thread_storage);
 
     const root = sink.createRoot(path, &stat);
     const dir = Dir.create(fd, stat.dev, exclude.getPatterns(path), root);
     _ = state.tryPush(dir);
 
-    for (sink_threads, state.threads, 0..) |*s, *t, n|
-        t.* = .{ .sink = s, .state = &state, .thread_num = n };
+    for (sink_threads, state.threads) |*s, *t|
+        t.* = .{ .sink = s, .state = &state };
 
-    // XXX: Continue with fewer threads on error?
-    for (state.threads[1..]) |*t| {
-        t.thread = std.Thread.spawn(
-            .{ .stack_size = 128 * 1024, .allocator = main.allocator }, Thread.run, .{t}
-        ) catch |e| ui.die("Error spawning thread: {}\n", .{e});
+    // Draw the scan screen before workers start. Otherwise a fast scan, or a
+    // main worker waiting for work, can leave the first visible frame to the
+    // hardlink-counting phase.
+    main.handleEvent(false, true);
+
+    if (main.config.scan_ui == .none) {
+        var active_threads: usize = 1;
+        while (active_threads < state.threads.len) : (active_threads += 1) {
+            const t = &state.threads[active_threads];
+            t.thread = std.Thread.spawn(.{ .stack_size = 128 * 1024, .allocator = main.allocator }, Thread.run, .{t}) catch {
+                // Keep scanning with the threads that were created successfully.
+                state.threads = state.threads[0..active_threads];
+                break;
+            };
+        }
+        state.threads[0].run();
+        for (state.threads[1..]) |*t| t.thread.join();
+    } else {
+        var active_threads: usize = 0;
+        while (active_threads < state.threads.len) : (active_threads += 1) {
+            const t = &state.threads[active_threads];
+            t.thread = std.Thread.spawn(.{ .stack_size = 128 * 1024, .allocator = main.allocator }, Thread.run, .{t}) catch {
+                // Keep scanning with the threads that were created successfully.
+                state.threads = state.threads[0..active_threads];
+                state.queue_lock.lock();
+                state.queue_cond.broadcast();
+                state.queue_lock.unlock();
+                break;
+            };
+        }
+
+        if (active_threads == 0) {
+            // If no worker can be created, fall back to scanning on the UI thread.
+            state.threads = state.threads[0..1];
+            state.threads[0].run();
+        } else {
+            while (state.finished.load(.acquire) < active_threads) {
+                main.handleEvent(false, false);
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            for (state.threads[0..active_threads]) |*t| t.thread.join();
+        }
     }
-    state.threads[0].run();
-    for (state.threads[1..]) |*t| t.thread.join();
 }

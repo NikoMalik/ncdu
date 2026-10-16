@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
+const assert = @import("fastmem.zig").assert;
+const hashmod = @import("hash.zig");
 const main = @import("main.zig");
 const c = @import("c.zig").c;
 
@@ -135,7 +137,7 @@ fn PatternList(comptime withsub: bool) type {
 
         const Ctx = struct {
             pub fn hash(_: Ctx, p: *const Pattern) u64 {
-                return std.hash.Wyhash.hash(0, p.pattern);
+                return hashmod.hash_inline(@as([]const u8, p.pattern), 0);
             }
             pub fn eql(_: Ctx, a: *const Pattern, b: *const Pattern) bool {
                 return std.mem.eql(u8, a.pattern, b.pattern);
@@ -145,7 +147,7 @@ fn PatternList(comptime withsub: bool) type {
         const Self = @This();
 
         fn append(self: *Self, pat: *const Pattern) void {
-            std.debug.assert((pat.sub != null) == withsub);
+            assert((pat.sub != null) == withsub);
             if (pat.isliteral) {
                 const e = self.literals.getOrPut(main.allocator, pat) catch unreachable;
                 if (!e.found_existing) {

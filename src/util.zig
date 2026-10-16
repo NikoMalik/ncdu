@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
+const assert = @import("fastmem.zig").assert;
 const c = @import("c.zig").c;
 
 // Cast any integer type to the target type, clamping the value to the supported maximum if necessary.
-pub fn castClamp(comptime T: type, x: anytype) T {
+pub inline fn castClamp(comptime T: type, x: anytype) T {
     // (adapted from std.math.cast)
     if (std.math.maxInt(@TypeOf(x)) > std.math.maxInt(T) and x > std.math.maxInt(T)) {
         return std.math.maxInt(T);
@@ -17,7 +18,7 @@ pub fn castClamp(comptime T: type, x: anytype) T {
 }
 
 // Cast any integer type to the target type, truncating if necessary.
-pub fn castTruncate(comptime T: type, x: anytype) T {
+pub inline fn castTruncate(comptime T: type, x: anytype) T {
     const Ti = @typeInfo(T).int;
     const Xi = @typeInfo(@TypeOf(x)).int;
     const nx: std.meta.Int(Ti.signedness, Xi.bits) = @bitCast(x);
@@ -25,7 +26,7 @@ pub fn castTruncate(comptime T: type, x: anytype) T {
 }
 
 // Multiplies by 512, saturating.
-pub fn blocksToSize(b: u64) u64 {
+pub inline fn blocksToSize(b: u64) u64 {
     return b *| 512;
 }
 
@@ -35,7 +36,7 @@ pub fn blocksToSize(b: u64) u64 {
 pub fn arrayListBufZ(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator) [:0]const u8 {
     buf.append(alloc, 0) catch unreachable;
     defer buf.items.len -= 1;
-    return buf.items[0..buf.items.len-1:0];
+    return buf.items[0 .. buf.items.len - 1 :0];
 }
 
 // Format an integer as right-aligned '###.#'.
@@ -43,7 +44,7 @@ pub fn arrayListBufZ(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator)
 //   std.fmt.bufPrintZ(.., "{d:>5.1}", @floatFromInt(n)/10.0);
 // Except this function doesn't pull in large float formatting tables.
 pub fn fmt5dec(n: u14) [5:0]u8 {
-    std.debug.assert(n <= 9999);
+    assert(n <= 9999);
     var buf: [5:0]u8 = "  0.0".*;
     var v = n;
     buf[4] += @intCast(v % 10);
@@ -67,7 +68,6 @@ test "fmt5dec" {
     try eq("123.9", &fmt5dec(1239));
     try eq("999.9", &fmt5dec(9999));
 }
-
 
 // Straightforward Zig port of strnatcmp() from https://github.com/sourcefrog/natsort/
 // (Requiring nul-terminated strings is ugly, but we've got them anyway and it does simplify the code)
@@ -94,8 +94,7 @@ pub fn strnatcmp(a: [:0]const u8, b: [:0]const u8) std.math.Order {
                 var bias = std.math.Order.eq;
                 while (true) {
                     if (!isDigit(a[ai]) and !isDigit(b[bi])) {
-                        if (bias != .eq or (a[ai] == 0 and b[bi] == 0)) return bias
-                        else break;
+                        if (bias != .eq or (a[ai] == 0 and b[bi] == 0)) return bias else break;
                     }
                     if (!isDigit(a[ai])) return .lt;
                     if (!isDigit(b[bi])) return .gt;
@@ -168,10 +167,9 @@ test "strnatcmp" {
     for (0..w.len) |i| {
         try eq(strnatcmp(w[i], w[i]), .eq);
         for (0..i) |j| try eq(strnatcmp(w[i], w[j]), .gt);
-        for (i+1..w.len) |j| try eq(strnatcmp(w[i], w[j]), .lt);
+        for (i + 1..w.len) |j| try eq(strnatcmp(w[i], w[j]), .lt);
     }
 }
-
 
 pub fn expanduser(path: []const u8, alloc: std.mem.Allocator) ![:0]u8 {
     if (path.len == 0 or path[0] != '~') return alloc.dupeZ(u8, path);
@@ -199,7 +197,6 @@ pub fn expanduser(path: []const u8, alloc: std.mem.Allocator) ![:0]u8 {
     return try std.mem.concatWithSentinel(alloc, u8, &.{ home, path[len..] }, 0);
 }
 
-
 // Silly abstraction to read a file one line at a time. Only exists to help
 // with supporting both Zig 0.14 and 0.15, can be removed once 0.14 support is
 // dropped.
@@ -222,7 +219,6 @@ pub const LineReader = if (@hasDecl(std.io, "bufferedReader")) struct {
         };
         return s.fbs.getWritten();
     }
-
 } else struct {
     rd: std.fs.File.Reader,
 

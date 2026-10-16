@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
+const fastmem = @import("fastmem.zig");
 const main = @import("main.zig");
 const util = @import("util.zig");
 const model = @import("model.zig");
@@ -18,7 +19,7 @@ const ZstdReader = struct {
 
     fn create(head: []const u8) *ZstdReader {
         const r = main.allocator.create(ZstdReader) catch unreachable;
-        @memcpy(r.inbuf[0..head.len], head);
+        fastmem.copy(u8, r.inbuf[0..head.len], head);
         r.in = .{
             .src = &r.inbuf,
             .size = head.len,
@@ -316,11 +317,11 @@ test "JSON parser" {
         \\}
         ;
     var p = Parser{ .rd = undefined, .rdsize = json.len };
-    @memcpy(p.buf[0..json.len], json);
+    fastmem.copy(u8, p.buf[0..json.len], json);
     p.skip();
 
     p = Parser{ .rd = undefined, .rdsize = json.len };
-    @memcpy(p.buf[0..json.len], json);
+    fastmem.copy(u8, p.buf[0..json.len], json);
     var buf: [128]u8 = undefined;
     p.obj();
 
@@ -539,7 +540,7 @@ pub fn import(fd: std.fs.File, head: []const u8) void {
         p.zstd = ZstdReader.create(head);
     } else {
         p.rdsize = head.len;
-        @memcpy(p.buf[0..head.len], head);
+        fastmem.copy(u8, p.buf[0..head.len], head);
     }
     p.array();
     if (p.uint(u16) != 1) p.die("incompatible major format version");

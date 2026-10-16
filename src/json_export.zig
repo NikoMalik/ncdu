@@ -8,6 +8,8 @@ const sink = @import("sink.zig");
 const util = @import("util.zig");
 const ui = @import("ui.zig");
 const c = @import("c.zig").c;
+const fastmem = @import("fastmem.zig");
+const strconv = @import("strconv.zig");
 
 // JSON output is necessarily single-threaded and items MUST be added depth-first.
 
@@ -88,7 +90,7 @@ pub const Writer = struct {
     }
 
     fn write(ctx: *Writer, s: []const u8) void {
-        @memcpy(ctx.buf[ctx.off..][0..s.len], s);
+        fastmem.copy(u8, ctx.buf[ctx.off..][0..s.len], s);
         ctx.off += s.len;
     }
 
@@ -120,22 +122,9 @@ pub const Writer = struct {
     }
 
     fn writeUint(ctx: *Writer, n: u64) void {
-        // Based on std.fmt.formatInt
-        var a = n;
-        var buf: [24]u8 = undefined;
-        var index: usize = buf.len;
-        while (a >= 100) : (a = @divTrunc(a, 100)) {
-            index -= 2;
-            buf[index..][0..2].* = std.fmt.digits2(@as(u8, @intCast(a % 100)));
-        }
-        if (a < 10) {
-            index -= 1;
-            buf[index] = '0' + @as(u8, @intCast(a));
-        } else {
-            index -= 2;
-            buf[index..][0..2].* = std.fmt.digits2(@as(u8, @intCast(a)));
-        }
-        ctx.write(buf[index..]);
+        var buf: [20]u8 = undefined;
+        const len = strconv.format_uint(u64, &buf, n);
+        ctx.write(buf[0..len]);
     }
 
     fn init(out: std.fs.File) *Writer {
